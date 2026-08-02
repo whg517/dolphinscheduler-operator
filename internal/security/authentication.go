@@ -8,9 +8,11 @@ import (
 	"emperror.dev/errors"
 	dolphinv1alpha1 "github.com/zncdatadev/dolphinscheduler-operator/api/v1alpha1"
 	authv1alpha1 "github.com/zncdatadev/operator-go/pkg/apis/authentication/v1alpha1"
-	"github.com/zncdatadev/operator-go/pkg/client"
+	opgosecurity "github.com/zncdatadev/operator-go/pkg/security"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 var authenticationLogger = ctrl.Log.WithName("authentication-log")
@@ -33,77 +35,72 @@ var (
 	SUPPORTED_OIDC_PROVIDERS                 = []OIDCIdentityProvierHit{Github}
 )
 
+// AuthenticationResult is the resolved authentication contribution to the api-server container.
 type AuthenticationResult struct {
-	// dolphin scheduler security configuration
-	// this will override the default security configuration in application.yaml
-	Config map[string]interface{}
+	// EnvVars are the security env vars, sorted by name (the legacy SortedMap rendering).
+	EnvVars []corev1.EnvVar
 
-	CredintialsSecrets []string
+	// LdapExportCommand, when non-empty, is the script prologue exporting the LDAP bind
+	// credentials from the mounted secret files.
+	LdapExportCommand string
 
-	// ldap bind credentials secret volume
-	LdapVolume *corev1.Volume
-
-	// ldap bind credentials secret volume mount
-	LdapVolumeMount *corev1.VolumeMount
-
-	// ldap bind credentials secret name
-	LdapBindCredintialsName string
+	// Provisioner supplies the LDAP bind-credentials CSI volume + mount; nil without LDAP.
+	Provisioner *opgosecurity.SecretProvisioner
 }
 
 // Authentication generates the authentication configuration for the Scheduler.
 // It resolves the AuthenticationClass and based on the provider in the
 // AuthenticationClass, it generates the configuration for the Scheduler.
 // Supported providers are LDAP and OIDC.
-// For OIDC, only Keycloak is supported.
 func Authentication(
 	ctx context.Context,
-	client *client.Client,
-	authSpec []dolphinv1alpha1.AuthenticationSpec) (result AuthenticationResult, err error) {
-	providers, err := resolveAuthentications(ctx, client, authSpec)
+	c ctrlclient.Client,
+	authSpec []dolphinv1alpha1.AuthenticationSpec,
+) (*AuthenticationResult, error) {
+	providers, err := resolveAuthentications(ctx, c, authSpec)
 	if err != nil {
+		// Legacy behavior: a resolution failure is logged and the remaining providers apply.
 		authenticationLogger.Error(err, "Failed to resolve AuthenticationClass")
 	}
-	// security env config
-	// this will override the default security configuration in application.yaml
-	var config map[string]interface{}
-	config, err = createAuthenticationConfig(providers)
+
+	config, err := createAuthenticationConfig(providers)
 	if err != nil {
 		authenticationLogger.Error(err, "Failed to create AuthenticationConfig")
-		return result, err
+		return nil, err
 	}
 
-	// ldap volume and volume mount
-	var volume *corev1.Volume
-	var volumeMount *corev1.VolumeMount
-	var ldapBindCredentialsName string
+	result := &AuthenticationResult{
+		EnvVars: sortedEnvVars(config),
+	}
+
 	for _, provider := range providers {
 		if provider.AuthType == LDAP {
 			if provider.Provider.LDAP == nil || provider.Provider.LDAP.BindCredentials == nil {
-				err = errors.New("ldap provider or bind credentials cannot be nil")
-				return result, err
+				return nil, errors.New("ldap provider or bind credentials cannot be nil")
 			}
-			volume, volumeMount = AddLdapCredintialsVolumesAndVolumeMounts(*provider.Provider.LDAP.BindCredentials)
-			ldapBindCredentialsName = provider.Provider.LDAP.BindCredentials.SecretClass
+			result.Provisioner = LdapBindCredentialsProvisioner(*provider.Provider.LDAP.BindCredentials)
+			result.LdapExportCommand = ExtractLdapCredintialsAndExportCommand()
 			break
 		}
 	}
 
-	// secret names for authentication
-	var secretNames = make([]string, 0)
-	// oidc secret, we can add other secret in the future
-	// this is deprecated, we use env source instead, as oidc clientId and secret key are the same name all,so we can use env source to map it
-	// reserve the field for future use
-	// for _, provider := range providers {
-	// 	secretNames = append(secretNames, provider.OidcCredentialSecret.Secret)
-	// }
+	return result, nil
+}
 
-	return AuthenticationResult{
-		Config:                  config,
-		LdapVolume:              volume,
-		LdapVolumeMount:         volumeMount,
-		LdapBindCredintialsName: ldapBindCredentialsName,
-		CredintialsSecrets:      secretNames,
-	}, nil
+// sortedEnvVars converts the generated security config (string values, or corev1.EnvVarSource
+// for secret-backed values) into an env var list sorted by name — the legacy SortedMap order.
+func sortedEnvVars(config map[string]interface{}) []corev1.EnvVar {
+	envs := make([]corev1.EnvVar, 0, len(config))
+	for _, name := range slices.Sorted(maps.Keys(config)) {
+		switch value := config[name].(type) {
+		case string:
+			envs = append(envs, corev1.EnvVar{Name: name, Value: value})
+		case corev1.EnvVarSource:
+			source := value
+			envs = append(envs, corev1.EnvVar{Name: name, ValueFrom: &source})
+		}
+	}
+	return envs
 }
 
 func createAuthenticationConfig(providers []AuthenticationProvider) (config map[string]interface{}, err error) {
@@ -138,13 +135,17 @@ func createAuthenticationConfig(providers []AuthenticationProvider) (config map[
 
 func resolveAuthentications(
 	ctx context.Context,
-	client *client.Client,
-	anthenticantions []dolphinv1alpha1.AuthenticationSpec) (providers []AuthenticationProvider, err error) {
+	c ctrlclient.Client,
+	anthenticantions []dolphinv1alpha1.AuthenticationSpec,
+) (providers []AuthenticationProvider, err error) {
 	for _, dolphinAuth := range anthenticantions {
 		var authclass *authv1alpha1.AuthenticationClass
-		if authclass, err = resolveAuthenticationClass(ctx, client, dolphinAuth.AuthenticationClass); err == nil {
+		if authclass, err = resolveAuthenticationClass(ctx, c, dolphinAuth.AuthenticationClass); err == nil {
 			var authprovider *AuthenticationProvider
 			authprovider, err = getAuthenticationProvider(authclass, dolphinAuth.Oidc)
+			if err != nil {
+				return
+			}
 			authType := authprovider.AuthType
 			if isAuthenticationSupported(authType) {
 				providers = append(providers, *authprovider)
@@ -159,15 +160,16 @@ func resolveAuthentications(
 
 func resolveAuthenticationClass(
 	ctx context.Context,
-	client *client.Client,
-	authClassRef string) (authclass *authv1alpha1.AuthenticationClass, err error) {
+	c ctrlclient.Client,
+	authClassRef string,
+) (*authv1alpha1.AuthenticationClass, error) {
+	// AuthenticationClass is cluster-scoped: no namespace in the lookup key.
 	authClassObject := &authv1alpha1.AuthenticationClass{}
-	if err = client.GetWithOwnerNamespace(ctx, authClassRef, authClassObject); err != nil {
-		authenticationLogger.Error(err, "Failed to get AuthenticationClass", "authClass ref", authClassRef, "namespace", client.GetOwnerNamespace())
-		return
+	if err := c.Get(ctx, types.NamespacedName{Name: authClassRef}, authClassObject); err != nil {
+		authenticationLogger.Error(err, "Failed to get AuthenticationClass", "authClass ref", authClassRef)
+		return nil, err
 	}
-	authclass = authClassObject
-	return
+	return authClassObject, nil
 }
 
 func getAuthenticationProvider(
@@ -182,19 +184,22 @@ func getAuthenticationProvider(
 		err = errors.New("AuthenticationProvider cannot be nil")
 		return
 	}
-	if provider.OIDC != nil {
+	switch {
+	case provider.OIDC != nil:
 		var providerHint OIDCIdentityProvierHit
 		providerHint, err = getOidcProviderHint(provider.OIDC)
 		if err != nil {
 			return
 		}
 		authProvider = NewOidcProvider(OIDC, providerHint, oidcSecretSpec, provider)
-	} else if provider.TLS != nil {
-		panic("unimplemented")
-	} else if provider.Static != nil {
-		panic("unimplemented")
-	} else if provider.LDAP != nil {
+	case provider.TLS != nil:
+		err = errors.New("TLS authentication provider is not supported")
+	case provider.Static != nil:
+		err = errors.New("static authentication provider is not supported")
+	case provider.LDAP != nil:
 		authProvider = NewLdapProvider(LDAP, provider)
+	default:
+		err = errors.New("no supported authentication provider is configured")
 	}
 	return
 }

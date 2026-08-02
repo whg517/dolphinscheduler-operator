@@ -7,20 +7,14 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/zncdatadev/dolphinscheduler-operator/pkg/util"
-	"github.com/zncdatadev/operator-go/pkg/client"
 )
 
 var _ = Describe("DataBaseExtractor", func() {
-	var cli *client.Client
-	BeforeEach(func() {
-		cli = client.NewClient(k8sClient, nil)
-	})
-
 	Context("when extracting database info", func() {
 		It("should extract database info from a valid connection string", func() {
 			// given
 			connectionString := "jdbc:postgresql://127.0.0.1:5432/dolphinscheduler?user=root&password=root"
-			d := util.NewDataBaseExtractor(cli, &connectionString)
+			d := util.NewDataBaseExtractor(k8sClient, &connectionString)
 
 			// when
 			dbInfo, err := d.ExtractDatabaseInfo(context.Background())

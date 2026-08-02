@@ -5,9 +5,9 @@ import (
 	"strings"
 
 	"emperror.dev/errors"
-	"github.com/zncdatadev/operator-go/pkg/client"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 const (
@@ -25,10 +25,9 @@ type DatabaseConfig struct {
 	DbName   string
 }
 
-func NewDataBaseExtractor(client *client.Client, connectionString *string) *DataBaseExtractor {
+func NewDataBaseExtractor(client ctrlclient.Client, connectionString *string) *DataBaseExtractor {
 	return &DataBaseExtractor{
 		ConnectionString: connectionString,
-		Ctx:              context.Background(),
 		Client:           client,
 	}
 }
@@ -37,8 +36,7 @@ type DataBaseExtractor struct {
 	ConnectionString    *string
 	SecretReferenceName *string
 	Namespace           *string
-	Ctx                 context.Context
-	Client              *client.Client
+	Client              ctrlclient.Client
 }
 
 func (d *DataBaseExtractor) CredentialsInSecret(secretRefName string, namespace string) *DataBaseExtractor {
@@ -57,7 +55,7 @@ func (d *DataBaseExtractor) ExtractDatabaseInfo(ctx context.Context) (*DatabaseC
 		return nil, err
 	}
 
-	if err := d.setCredentials(dbInfo); err != nil {
+	if err := d.setCredentials(ctx, dbInfo); err != nil {
 		return nil, err
 	}
 
@@ -94,27 +92,23 @@ func (d *DataBaseExtractor) parseConnectionString() (*DatabaseConfig, error) {
 	return dbInfo, nil
 }
 
-func (d *DataBaseExtractor) setCredentials(dbInfo *DatabaseConfig) error {
+func (d *DataBaseExtractor) setCredentials(ctx context.Context, dbInfo *DatabaseConfig) error {
 	if d.SecretReferenceName != nil {
-		return d.setCredentialsFromSecret(dbInfo)
+		return d.setCredentialsFromSecret(ctx, dbInfo)
 	}
 	return d.setCredentialsFromConnectionString(dbInfo)
 }
 
-func (d *DataBaseExtractor) setCredentialsFromSecret(dbInfo *DatabaseConfig) error {
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: *d.Namespace,
-			Name:      *d.SecretReferenceName,
-		},
-	}
+func (d *DataBaseExtractor) setCredentialsFromSecret(ctx context.Context, dbInfo *DatabaseConfig) error {
+	secret := &corev1.Secret{}
 
 	details := map[string]interface{}{
 		"namespace":   d.Namespace,
 		"secret_name": *d.SecretReferenceName,
 	}
 
-	if err := d.Client.GetWithObject(d.Ctx, secret); err != nil {
+	key := types.NamespacedName{Namespace: *d.Namespace, Name: *d.SecretReferenceName}
+	if err := d.Client.Get(ctx, key, secret); err != nil {
 		return errors.WrapWithDetails(err, "failed to get database secret", details)
 	}
 

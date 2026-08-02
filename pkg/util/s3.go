@@ -7,9 +7,9 @@ import (
 	"emperror.dev/errors"
 	commonsv1alpha1 "github.com/zncdatadev/operator-go/pkg/apis/commons/v1alpha1"
 	s3v1alpha1 "github.com/zncdatadev/operator-go/pkg/apis/s3/v1alpha1"
-	"github.com/zncdatadev/operator-go/pkg/client"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 const (
@@ -27,12 +27,14 @@ type S3Config struct {
 }
 
 type S3ConfigExtractor struct {
-	client    *client.Client
+	client    ctrlclient.Client
 	Namespace string
 	S3Spec    *s3v1alpha1.S3BucketSpec
 }
 
-func NewS3ConfigExtractor(client *client.Client, s3Spec *s3v1alpha1.S3BucketSpec, namespace string) *S3ConfigExtractor {
+func NewS3ConfigExtractor(
+	client ctrlclient.Client, s3Spec *s3v1alpha1.S3BucketSpec, namespace string,
+) *S3ConfigExtractor {
 	return &S3ConfigExtractor{
 		client:    client,
 		Namespace: namespace,
@@ -104,14 +106,9 @@ func (s *S3ConfigExtractor) GetS3ConfigFromConnectionReferenceName(
 		return
 	}
 
-	s3Conn := &s3v1alpha1.S3Connection{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: s.Namespace,
-			Name:      connRefName,
-		},
-	}
+	s3Conn := &s3v1alpha1.S3Connection{}
 
-	err = s.client.GetWithObject(ctx, s3Conn)
+	err = s.client.Get(ctx, types.NamespacedName{Namespace: s.Namespace, Name: connRefName}, s3Conn)
 	if err != nil {
 		err = errors.WrapWithDetails(err, "failed to get s3 connection with connection reference name",
 			"ref name", connRefName, "namespace", s.Namespace)
@@ -144,13 +141,8 @@ func (s *S3ConfigExtractor) GetS3SecretData(ctx context.Context,
 		err = errors.New("S3 secret class cannot be empty")
 		return
 	}
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: s.Namespace,
-			Name:      name,
-		},
-	}
-	err = s.client.GetWithObject(ctx, secret)
+	secret := &corev1.Secret{}
+	err = s.client.Get(ctx, types.NamespacedName{Namespace: s.Namespace, Name: name}, secret)
 	if err != nil {
 		return
 	}
