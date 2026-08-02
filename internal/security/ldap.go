@@ -3,7 +3,6 @@ package security
 import (
 	"fmt"
 	"path"
-	"strings"
 
 	dolphinv1alpha1 "github.com/zncdatadev/dolphinscheduler-operator/api/v1alpha1"
 	authv1alpha1 "github.com/zncdatadev/operator-go/pkg/apis/authentication/v1alpha1"
@@ -96,28 +95,14 @@ func LdapBindCredentialsProvisioner(bindCredentials commonsv1alpha1.Credentials)
 		bindCredentials.SecretClass,
 	).WithStorageSize(ldapBindCredentialsStorageSize)
 
-	if scope := legacyScopeString(bindCredentials.Scope); scope != "" {
+	// The legacy operator joined bare service names into the scope annotation, which the
+	// secret-operator parser skips — a service-scoped bind credential silently lost its scope.
+	// ScopeString emits the required "service=<name>" form.
+	if scope := opgosecurity.ScopeString(bindCredentials.Scope); scope != "" {
 		registration = registration.WithScope(scope)
 	}
 
 	return opgosecurity.NewSecretProvisioner().
 		WithMountBasePath(opgoconstant.KubedoopSecretDir).
 		Register(registration)
-}
-
-// legacyScopeString renders the scope annotation exactly as the legacy operator did:
-// "node", "pod" and the service names, comma-joined, in that order. Empty when no scope is set.
-func legacyScopeString(scope *commonsv1alpha1.CredentialsScope) string {
-	if scope == nil {
-		return ""
-	}
-	scopes := []string{}
-	if scope.Node {
-		scopes = append(scopes, "node")
-	}
-	if scope.Pod {
-		scopes = append(scopes, "pod")
-	}
-	scopes = append(scopes, scope.Services...)
-	return strings.Join(scopes, ",")
 }
