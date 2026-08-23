@@ -44,26 +44,35 @@ const (
 	zkConnectStringEnvName = "REGISTRY_ZOOKEEPER_CONNECT_STRING"
 
 	// configVolumeName is the framework-owned role group ConfigMap volume.
-	configVolumeName = "config"
+	configVolumeName = reconciler.ConfigVolumeName
+
+	// workerDataVolumeName is the worker's data claim template name (legacy "worker-data").
+	workerDataVolumeName = "worker-data"
+
+	// workerDataMountPath is where the worker's data PVC is mounted: the data.basedir.path of
+	// common.properties, i.e. the directory the worker writes task working data to. The legacy
+	// operator rendered the claim but never mounted it; the framework refuses an unmounted claim.
+	workerDataMountPath = "/tmp/dolphinscheduler"
 
 	// curlCommand is the probe binary of the legacy actuator exec probes.
 	curlCommand = "curl"
 )
 
 // DolphinSchedulerRoleGroupHandler builds the resources of a DolphinScheduler role group on top
-// of reconciler.BaseRoleGroupHandler: the base handler owns labels, Services, the workload
-// (StatefulSet for master/worker, Deployment for api/alert) and the ConfigMap skeleton, while
-// this handler contributes the product specifics through the declared handler fields and the
-// MainContainerCustomizer.
+// of reconciler.BaseRoleGroupHandler: the base handler owns labels, Services, the StatefulSet
+// and the ConfigMap skeleton, while this handler declares the roles (reconciler.RoleProvider)
+// and contributes the product specifics through post-build edits.
 type DolphinSchedulerRoleGroupHandler struct {
 	reconciler.BaseRoleGroupHandler[*dolphinv1alpha1.DolphinschedulerCluster]
 }
 
 var _ reconciler.RoleGroupHandler[*dolphinv1alpha1.DolphinschedulerCluster] = &DolphinSchedulerRoleGroupHandler{}
+var _ reconciler.RoleProvider[*dolphinv1alpha1.DolphinschedulerCluster] = &DolphinSchedulerRoleGroupHandler{}
 
-// productImageDefaults supplies whatever spec.image leaves empty, evaluated every reconcile so
-// an operator upgrade moves clusters onto the co-released product image.
-func productImageDefaults() commonsv1alpha1.ImageSpec {
+// ProductImageDefaults supplies whatever spec.image leaves empty, evaluated every reconcile so
+// an operator upgrade moves clusters onto the co-released product image. It is the single image
+// literal behind both GenericReconcilerConfig.ImageResolution.Defaults and the DB-init Job.
+func ProductImageDefaults() commonsv1alpha1.ImageSpec {
 	return commonsv1alpha1.ImageSpec{
 		Repo:            dolphinv1alpha1.DefaultRepository,
 		ProductVersion:  dolphinv1alpha1.DefaultProductVersion,
@@ -72,83 +81,174 @@ func productImageDefaults() commonsv1alpha1.ImageSpec {
 }
 
 // resolveProductImage resolves the container image and pull policy for the cluster from
-// spec.image folded over the product defaults (also used by the DB-init Job).
+// spec.image folded over the product defaults. The role path resolves through the framework
+// (ImageResolution); this survives only for the DB-init Job, which is outside the role path.
 func resolveProductImage(cr *dolphinv1alpha1.DolphinschedulerCluster) (string, corev1.PullPolicy, error) {
 	spec := cr.GetSpec().Image
-	image, err := spec.ResolveImage(dolphinv1alpha1.DefaultProductName, productImageDefaults())
+	image, err := spec.ResolveImage(dolphinv1alpha1.DefaultProductName, ProductImageDefaults())
 	if err != nil {
 		return "", "", err
 	}
-	return image, spec.ResolvedPullPolicy(productImageDefaults()), nil
+	return image, spec.ResolvedPullPolicy(ProductImageDefaults()), nil
 }
 
-// NewDolphinSchedulerRoleGroupHandler creates the handler with every reconcile-invariant
-// setting: ports, workload kinds, container names, logging declarations and identity labels.
+// NewDolphinSchedulerRoleGroupHandler creates the handler. All per-role knowledge lives in
+// DeclareRoles now; the handler itself carries only the reconcile-invariant identity settings.
 func NewDolphinSchedulerRoleGroupHandler(scheme *runtime.Scheme) *DolphinSchedulerRoleGroupHandler {
 	h := &DolphinSchedulerRoleGroupHandler{}
 	h.Scheme = scheme
-	h.ImagePullPolicy = corev1.PullIfNotPresent
-	h.ProductName = dolphinv1alpha1.DefaultProductName
-	h.ImageDefaults = productImageDefaults()
 	h.LabelDomain = LabelDomain
-	// Keep the legacy shared log emptyDir size (the framework default is larger).
-	h.LogVolumeSize = legacyLogVolumeSize
+	return h
+}
 
-	// NOTE: StorageMountPath is deliberately NOT set. It is handler-global, and the legacy
-	// operator rendered no data PVC for master (and never mounted worker's) — setting it would
-	// give every StatefulSet role a PVC and break parity. Framework gap: per-role storage.
-
-	for role, container := range mainContainerNames {
-		h.SetRoleMainContainerName(role, container)
-		h.SetRoleLoggingContainers(role, []productlogging.ContainerLogging{{
-			Container:   container,
-			Framework:   productlogging.LoggingFrameworkLogback,
-			FileName:    dolphinv1alpha1.LogbackPropertiesFileName,
-			Pattern:     dolphinv1alpha1.ConsoleConversionPattern,
-			LogFileName: fmt.Sprintf("%s.log4j.xml", container),
-		}})
-	}
-
-	// api and alert are stateless fronts over the database/registry: they have always been
-	// Deployments and the e2e suites pin the kind.
-	h.SetRoleWorkloadKind(dolphinv1alpha1.RoleApi, reconciler.WorkloadKindDeployment)
-	h.SetRoleWorkloadKind(dolphinv1alpha1.RoleAlert, reconciler.WorkloadKindDeployment)
-
-	// Container and Service ports, byte-identical (names, numbers, order) to the legacy
-	// rendering (the order is the legacy sorted-by-name order).
-	rolePorts := map[string][]corev1.ContainerPort{
-		dolphinv1alpha1.RoleMaster: {
+// rolePorts returns the container ports of a role, byte-identical (names, numbers, order) to
+// the legacy rendering (the order is the legacy sorted-by-name order).
+func rolePorts(roleName string) []corev1.ContainerPort {
+	switch roleName {
+	case dolphinv1alpha1.RoleMaster:
+		return []corev1.ContainerPort{
 			{Name: dolphinv1alpha1.MasterActualPortName, ContainerPort: dolphinv1alpha1.MasterActualPort, Protocol: corev1.ProtocolTCP},
 			{Name: dolphinv1alpha1.MasterPortName, ContainerPort: dolphinv1alpha1.MasterPort, Protocol: corev1.ProtocolTCP},
-		},
-		dolphinv1alpha1.RoleWorker: {
+		}
+	case dolphinv1alpha1.RoleWorker:
+		return []corev1.ContainerPort{
 			{Name: dolphinv1alpha1.WorkerActualPortName, ContainerPort: dolphinv1alpha1.WorkerActualPort, Protocol: corev1.ProtocolTCP},
 			{Name: dolphinv1alpha1.WorkerPortName, ContainerPort: dolphinv1alpha1.WorkerPort, Protocol: corev1.ProtocolTCP},
-		},
-		dolphinv1alpha1.RoleApi: {
+		}
+	case dolphinv1alpha1.RoleApi:
+		return []corev1.ContainerPort{
 			{Name: dolphinv1alpha1.ApiPortName, ContainerPort: dolphinv1alpha1.ApiPort, Protocol: corev1.ProtocolTCP},
 			{Name: dolphinv1alpha1.ApiPythonPortName, ContainerPort: dolphinv1alpha1.ApiPythonPort, Protocol: corev1.ProtocolTCP},
-		},
-		dolphinv1alpha1.RoleAlert: {
+		}
+	case dolphinv1alpha1.RoleAlert:
+		return []corev1.ContainerPort{
 			{Name: dolphinv1alpha1.AlerterActualPortName, ContainerPort: dolphinv1alpha1.AlerterActualPort, Protocol: corev1.ProtocolTCP},
 			{Name: dolphinv1alpha1.AlerterPortName, ContainerPort: dolphinv1alpha1.AlerterPort, Protocol: corev1.ProtocolTCP},
-		},
-	}
-	for role, ports := range rolePorts {
-		h.SetRoleContainerPorts(role, ports)
-		svcPorts := make([]corev1.ServicePort, 0, len(ports))
-		for _, p := range ports {
-			svcPorts = append(svcPorts, corev1.ServicePort{
-				Name:       p.Name,
-				Port:       p.ContainerPort,
-				Protocol:   p.Protocol,
-				TargetPort: intstr.FromString(p.Name),
-			})
 		}
-		h.SetRoleServicePorts(role, svcPorts)
+	default:
+		return nil
+	}
+}
+
+// servicePortsFor mirrors the container ports as Service ports with a named targetPort, the
+// legacy shape.
+func servicePortsFor(ports []corev1.ContainerPort) []corev1.ServicePort {
+	svcPorts := make([]corev1.ServicePort, 0, len(ports))
+	for _, p := range ports {
+		svcPorts = append(svcPorts, corev1.ServicePort{
+			Name:       p.Name,
+			Port:       p.ContainerPort,
+			Protocol:   p.Protocol,
+			TargetPort: intstr.FromString(p.Name),
+		})
+	}
+	return svcPorts
+}
+
+// DeclareRoles implements reconciler.RoleProvider: everything a DolphinScheduler role is made
+// of — container name, ports, command + start script, env, probes, log producers, config
+// defaults and the worker data volume — computed once per reconcile from THIS cr.
+func (h *DolphinSchedulerRoleGroupHandler) DeclareRoles(
+	ctx context.Context,
+	c ctrlclient.Client,
+	cr *dolphinv1alpha1.DolphinschedulerCluster,
+) (reconciler.RoleCatalog, error) {
+	clusterConfig := cr.Spec.ClusterConfig
+	if clusterConfig == nil {
+		return nil, fmt.Errorf("spec.clusterConfig is required")
 	}
 
-	return h
+	// Authentication (api role only): resolves the AuthenticationClass into container env and,
+	// for LDAP, a credentials-export prologue for the start script. The CSI bind-credentials
+	// volume is resolved again in BuildResources (per role group), where VolumeProviders live.
+	var auth *security.AuthenticationResult
+	if clusterConfig.Authentication != nil {
+		var err error
+		auth, err = security.Authentication(ctx, c, clusterConfig.Authentication)
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve authentication: %w", err)
+		}
+	}
+
+	catalog := reconciler.RoleCatalog{}
+	for role, container := range mainContainerNames {
+		metricsPort, err := metricsPortForRole(role)
+		if err != nil {
+			return nil, err
+		}
+
+		resources, err := roleResourceDefaults(role)
+		if err != nil {
+			return nil, err
+		}
+		affinity, err := defaultRoleAffinity(cr.Name, role)
+		if err != nil {
+			return nil, err
+		}
+
+		// Command carries the start script as its last element: the declaration has no Args
+		// slot by design, so args stay purely the user's cliOverrides. The LDAP
+		// credentials-export prologue precedes the single start block (api only).
+		script := mainContainerScript(role)
+		if role == dolphinv1alpha1.RoleApi && auth != nil && auth.LdapExportCommand != "" {
+			script = auth.LdapExportCommand + "\n" + script
+		}
+
+		// Product env: sorted role defaults, then the ZooKeeper discovery env, then (api only)
+		// the auth env. Declared env is emitted beneath the merged overrides, so a user's
+		// envOverrides of the same name still wins at runtime.
+		env := roleEnvDefaults(role)
+		env = append(env, corev1.EnvVar{
+			Name: zkConnectStringEnvName,
+			ValueFrom: &corev1.EnvVarSource{
+				ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: clusterConfig.ZookeeperConfigMapName},
+					Key:                  constant.ZookeeperDiscoveryKey,
+				},
+			},
+		})
+		if role == dolphinv1alpha1.RoleApi && auth != nil {
+			env = append(env, auth.EnvVars...)
+		}
+
+		ports := rolePorts(role)
+		decl := reconciler.RoleDeclaration{
+			MainContainerName: container,
+			ContainerPorts:    ports,
+			ServicePorts:      servicePortsFor(ports),
+			Command:           append(slices.Clone(containerCommand), script),
+			Env:               env,
+			ReadinessProbe:    actuatorProbe(metricsPort, "readiness"),
+			LivenessProbe:     actuatorProbe(metricsPort, "liveness"),
+			StartupProbe:      startupProbe(metricsPort),
+			LogProducers: []productlogging.ContainerLogging{{
+				Container: container,
+				Framework: productlogging.LoggingFrameworkLogback,
+				FileName:  dolphinv1alpha1.LogbackPropertiesFileName,
+				Pattern:   dolphinv1alpha1.ConsoleConversionPattern,
+			}},
+			// Keep the legacy shared log emptyDir size (the framework default is larger).
+			LogVolumeSize: legacyLogVolumeSize,
+			ConfigDefaults: &commonsv1alpha1.RoleGroupConfigSpec{
+				Resources:               resources,
+				Affinity:                affinity,
+				GracefulShutdownTimeout: ptr.To(defaultGracefulShutdown),
+			},
+		}
+
+		// Only the worker has a data PVC: the claim is built from the effective
+		// config.resources.storage (2Gi default) and mounted at data.basedir.path.
+		if role == dolphinv1alpha1.RoleWorker {
+			decl.DataVolume = &reconciler.DataVolume{
+				Name:      workerDataVolumeName,
+				MountPath: workerDataMountPath,
+			}
+		}
+
+		catalog[role] = decl
+	}
+
+	return catalog, nil
 }
 
 // BuildResources builds all resources of one DolphinScheduler role group.
@@ -158,8 +258,10 @@ func (h *DolphinSchedulerRoleGroupHandler) BuildResources(
 	cr *dolphinv1alpha1.DolphinschedulerCluster,
 	buildCtx *reconciler.RoleGroupBuildContext,
 ) (*reconciler.RoleGroupResources, error) {
-	if _, known := mainContainerNames[buildCtx.RoleName]; !known {
-		return nil, fmt.Errorf("unsupported role: %s", buildCtx.RoleName)
+	roleName := buildCtx.RoleName
+	containerName, known := mainContainerNames[roleName]
+	if !known {
+		return nil, fmt.Errorf("unsupported role: %s", roleName)
 	}
 
 	clusterConfig := cr.Spec.ClusterConfig
@@ -167,19 +269,11 @@ func (h *DolphinSchedulerRoleGroupHandler) BuildResources(
 		return nil, fmt.Errorf("spec.clusterConfig is required")
 	}
 
-	// Fill the product defaults (resources, anti-affinity, graceful shutdown) the framework
-	// does not supply, before the base handler consumes the config.
-	if err := h.ensureRoleGroupConfigDefaults(cr, buildCtx); err != nil {
-		return nil, err
-	}
-
-	// Authentication (api role only): resolves the AuthenticationClass into container env and,
-	// for LDAP, a CSI bind-credentials volume plus a credentials-export prologue for the start
-	// script.
-	var auth *security.AuthenticationResult
-	if buildCtx.RoleName == dolphinv1alpha1.RoleApi && clusterConfig.Authentication != nil {
-		var err error
-		auth, err = security.Authentication(ctx, k8sClient, clusterConfig.Authentication)
+	// Authentication (api role only): re-resolved here (client reads are cached) for the CSI
+	// bind-credentials volume, which is per role group; env and the script prologue are already
+	// in the declaration from DeclareRoles.
+	if roleName == dolphinv1alpha1.RoleApi && clusterConfig.Authentication != nil {
+		auth, err := security.Authentication(ctx, k8sClient, clusterConfig.Authentication)
 		if err != nil {
 			return nil, fmt.Errorf("failed to resolve authentication: %w", err)
 		}
@@ -188,13 +282,47 @@ func (h *DolphinSchedulerRoleGroupHandler) BuildResources(
 		}
 	}
 
-	// Every product-specific edit of the primary container goes through the customizer, which
-	// runs before podOverrides so user overrides keep the last word.
-	buildCtx.MainContainerCustomizer = h.mainContainerCustomizer(cr, buildCtx, auth)
-
 	res, err := h.BaseRoleGroupHandler.BuildResources(ctx, k8sClient, cr, buildCtx)
 	if err != nil {
 		return nil, err
+	}
+
+	// Post-build edits of the primary container (matched by name, never index): the envFrom on
+	// "<cluster>-envs" and the two subPath config mounts. Neither has a declaration channel:
+	// envFrom is not a declaration field, and a subPath mount targets a file path inside the
+	// product's conf directory. The framework's whole-directory config mount at
+	// /kubedoop/mount/config is kept (harmless read-only directory).
+	containers := res.StatefulSet.Spec.Template.Spec.Containers
+	for i := range containers {
+		if containers[i].Name != containerName {
+			continue
+		}
+		c := &containers[i]
+
+		c.EnvFrom = append(c.EnvFrom, corev1.EnvFromSource{
+			ConfigMapRef: &corev1.ConfigMapEnvSource{
+				LocalObjectReference: corev1.LocalObjectReference{Name: envsConfigMapName(buildCtx.ClusterName)},
+			},
+		})
+
+		// DolphinScheduler reads its config files at fixed paths inside the server's conf
+		// directory, so mount the same "config" volume (the role group ConfigMap) twice more
+		// with a subPath, ahead of the framework's mounts (legacy mount order).
+		mounts := make([]corev1.VolumeMount, 0, len(c.VolumeMounts)+2)
+		mounts = append(mounts,
+			corev1.VolumeMount{
+				Name:      configVolumeName,
+				MountPath: roleConfigPath(roleName, dolphinv1alpha1.DolphinCommonPropertiesName),
+				SubPath:   dolphinv1alpha1.DolphinCommonPropertiesName,
+			},
+			corev1.VolumeMount{
+				Name:      configVolumeName,
+				MountPath: roleConfigPath(roleName, dolphinv1alpha1.LogbackPropertiesFileName),
+				SubPath:   dolphinv1alpha1.LogbackPropertiesFileName,
+			},
+		)
+		mounts = append(mounts, c.VolumeMounts...)
+		c.VolumeMounts = mounts
 	}
 
 	// common.properties: re-render the merged key set (product defaults < role < group
@@ -218,52 +346,6 @@ func (h *DolphinSchedulerRoleGroupHandler) BuildResources(
 	return res, nil
 }
 
-// ensureRoleGroupConfigDefaults writes the product defaults into the (already role-folded) role
-// group config when unset: legacy per-role resources, the weight-70 hostname anti-affinity and
-// the 120s graceful shutdown.
-func (h *DolphinSchedulerRoleGroupHandler) ensureRoleGroupConfigDefaults(
-	cr *dolphinv1alpha1.DolphinschedulerCluster,
-	buildCtx *reconciler.RoleGroupBuildContext,
-) error {
-	cfg := buildCtx.RoleGroupSpec.Config
-	if cfg == nil {
-		cfg = &commonsv1alpha1.RoleGroupConfigSpec{}
-		buildCtx.RoleGroupSpec.Config = cfg
-	}
-
-	defaults, err := roleResourceDefaults(buildCtx.RoleName)
-	if err != nil {
-		return err
-	}
-	if cfg.Resources == nil {
-		cfg.Resources = defaults
-	} else {
-		if cfg.Resources.CPU == nil {
-			cfg.Resources.CPU = defaults.CPU
-		}
-		if cfg.Resources.Memory == nil {
-			cfg.Resources.Memory = defaults.Memory
-		}
-		if cfg.Resources.Storage == nil {
-			cfg.Resources.Storage = defaults.Storage
-		}
-	}
-
-	if cfg.Affinity == nil {
-		affinity, err := defaultRoleAffinity(cr.Name, buildCtx.RoleName)
-		if err != nil {
-			return err
-		}
-		cfg.Affinity = affinity
-	}
-
-	if cfg.GracefulShutdownTimeout == nil {
-		cfg.GracefulShutdownTimeout = ptr.To(defaultGracefulShutdown)
-	}
-
-	return nil
-}
-
 // roleConfigPath returns the config file path inside the container:
 // /kubedoop/dolphinscheduler/<role>-server/conf/<file>.
 func roleConfigPath(roleName, fileName string) string {
@@ -273,90 +355,6 @@ func roleConfigPath(roleName, fileName string) string {
 // envsConfigMapName is the cluster-wide env ConfigMap every container envFroms.
 func envsConfigMapName(clusterName string) string {
 	return clusterName + "-envs"
-}
-
-// mainContainerCustomizer reproduces the legacy primary container exactly: command and start
-// script, sorted role env plus the ZooKeeper discovery env, the envFrom on "<cluster>-envs",
-// the actuator exec probes and the subPath config mounts.
-func (h *DolphinSchedulerRoleGroupHandler) mainContainerCustomizer(
-	cr *dolphinv1alpha1.DolphinschedulerCluster,
-	buildCtx *reconciler.RoleGroupBuildContext,
-	auth *security.AuthenticationResult,
-) func(c *corev1.Container) error {
-	roleName := buildCtx.RoleName
-	zookeeperConfigMapName := cr.Spec.ClusterConfig.ZookeeperConfigMapName
-
-	return func(c *corev1.Container) error {
-		metricsPort, err := metricsPortForRole(roleName)
-		if err != nil {
-			return err
-		}
-
-		// Command and start script. The LDAP credentials-export prologue precedes the single
-		// start block (the legacy api rendering duplicated the block; deliberately fixed, D12).
-		script := mainContainerScript(roleName)
-		if auth != nil && auth.LdapExportCommand != "" {
-			script = auth.LdapExportCommand + "\n" + script
-		}
-		c.Command = slices.Clone(containerCommand)
-		// Keep whatever args the builder already placed (user cliOverrides) after the script.
-		c.Args = append([]string{script}, c.Args...)
-
-		// Product env first (sorted role defaults, then auth env, then the ZooKeeper discovery
-		// env), then the builder-supplied env (user envOverrides and product env defaults from
-		// ProductConfig), which keeps the user's values winning at runtime.
-		env := roleEnvDefaults(roleName)
-		if auth != nil {
-			env = append(env, auth.EnvVars...)
-		}
-		env = append(env, corev1.EnvVar{
-			Name: zkConnectStringEnvName,
-			ValueFrom: &corev1.EnvVarSource{
-				ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{Name: zookeeperConfigMapName},
-					Key:                  constant.ZookeeperDiscoveryKey,
-				},
-			},
-		})
-		c.Env = append(env, c.Env...)
-
-		c.EnvFrom = append(c.EnvFrom, corev1.EnvFromSource{
-			ConfigMapRef: &corev1.ConfigMapEnvSource{
-				LocalObjectReference: corev1.LocalObjectReference{Name: envsConfigMapName(buildCtx.ClusterName)},
-			},
-		})
-
-		c.ReadinessProbe = actuatorProbe(metricsPort, "readiness")
-		c.LivenessProbe = actuatorProbe(metricsPort, "liveness")
-		c.StartupProbe = startupProbe(metricsPort)
-
-		// Mounts: DolphinScheduler reads its config files at fixed paths inside the server's
-		// conf directory, so replace the framework's whole-directory config mount with two
-		// subPath mounts of the same "config" volume (the role group ConfigMap). Every other
-		// mount (CSI credential volumes from VolumeProviders) is kept.
-		mounts := make([]corev1.VolumeMount, 0, len(c.VolumeMounts)+2)
-		mounts = append(mounts,
-			corev1.VolumeMount{
-				Name:      configVolumeName,
-				MountPath: roleConfigPath(roleName, dolphinv1alpha1.DolphinCommonPropertiesName),
-				SubPath:   dolphinv1alpha1.DolphinCommonPropertiesName,
-			},
-			corev1.VolumeMount{
-				Name:      configVolumeName,
-				MountPath: roleConfigPath(roleName, dolphinv1alpha1.LogbackPropertiesFileName),
-				SubPath:   dolphinv1alpha1.LogbackPropertiesFileName,
-			},
-		)
-		for _, m := range c.VolumeMounts {
-			if m.Name == configVolumeName && m.SubPath == "" {
-				continue
-			}
-			mounts = append(mounts, m)
-		}
-		c.VolumeMounts = mounts
-
-		return nil
-	}
 }
 
 // actuatorProbe is the legacy Spring actuator exec probe (curl, 30s delay, 30s period).

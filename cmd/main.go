@@ -140,8 +140,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	// The extension registry runs the cluster extension that provisions the workload RBAC, the
-	// "<cluster>-envs" ConfigMap and the create-once DB schema init Job before any role group.
+	// Cheap start-up insurance: the product config type must stay foldable (it currently only
+	// embeds the commons RoleGroupConfigSpec, which validates clean).
+	if err := reconciler.ValidateProductConfigType[dolphinschedulerv1alpha1.ConfigSpec](); err != nil {
+		setupLog.Error(err, "product config type is not foldable")
+		os.Exit(1)
+	}
+
+	// The extension registry runs the cluster extension that provisions the "<cluster>-envs"
+	// ConfigMap and the create-once DB schema init Job before any role group (plus the
+	// Deployment-to-StatefulSet upgrade guard).
 	extensionRegistry := opcommon.NewExtensionRegistry[*dolphinschedulerv1alpha1.DolphinschedulerCluster]()
 	extensionRegistry.RegisterClusterExtension(controller.NewClusterExtension(mgr.GetScheme()))
 
@@ -158,9 +166,24 @@ func main() {
 			// replacement GetEventRecorder returns the incompatible events.EventRecorder.
 			Recorder:         mgr.GetEventRecorderFor("dolphinscheduler-cluster-controller"), //nolint:staticcheck
 			RoleGroupHandler: roleGroupHandler,
-			// Static workload SA name: the pod spec and the workload RBAC reference it (D5).
-			ServiceAccountName: dolphinschedulerv1alpha1.DefaultProductName,
-			ProductConfig:      controller.ProductConfig,
+			// The handler declares the four roles; the reconciler resolves images and folds the
+			// config defaults from the catalog.
+			RoleProvider: roleGroupHandler,
+			ImageResolution: reconciler.ImageResolution{
+				ProductName: dolphinschedulerv1alpha1.DefaultProductName,
+				Defaults:    controller.ProductImageDefaults(),
+			},
+			RoleGroupResolver: reconciler.RoleGroupResolverFunc[*dolphinschedulerv1alpha1.DolphinschedulerCluster](
+				controller.ResolveRoleGroup),
+			// The workload pods' permissions, bound to the derived ServiceAccount
+			// ("dolphinschedulercluster-<cluster>"): the registry discovery ConfigMap read.
+			WorkloadRBACRules: func(_ *dolphinschedulerv1alpha1.DolphinschedulerCluster) []rbacv1.PolicyRule {
+				return []rbacv1.PolicyRule{{
+					APIGroups: []string{""},
+					Resources: []string{"configmaps"},
+					Verbs:     []string{"get", "list", "watch"},
+				}}
+			},
 			Dependencies: func(cr *dolphinschedulerv1alpha1.DolphinschedulerCluster) []reconciler.Dependency {
 				var deps []reconciler.Dependency
 				if cc := cr.Spec.ClusterConfig; cc != nil {
@@ -188,12 +211,10 @@ func main() {
 	}
 
 	if err := dolphinReconciler.SetupWithManagerOpts(mgr, reconciler.SetupWithManagerOptions{
-		// The extension-owned kinds: watched for out-of-band edits and (where per-role-group)
-		// reclaimed by the cleaner.
+		// The extension-owned kinds: watched for out-of-band edits. The framework registers the
+		// Role/RoleBinding watches itself when WorkloadRBACRules is set.
 		ExtraOwns: []ctrlclient.Object{
 			&batchv1.Job{},
-			&rbacv1.Role{},
-			&rbacv1.RoleBinding{},
 		},
 	}); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "DolphinschedulerCluster")

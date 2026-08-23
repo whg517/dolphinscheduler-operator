@@ -14,7 +14,8 @@ const (
 	legacyName      = "dolphinschedulercluster"
 )
 
-// The app.kubernetes.io label keys used by the legacy label sets and the default affinity.
+// The app.kubernetes.io label keys used by the legacy label sets (the default anti-affinity now
+// derives the same instance/component pair from reconciler.RoleSelectorLabels).
 const (
 	labelInstanceKey  = "app.kubernetes.io/instance"
 	labelNameKey      = "app.kubernetes.io/name"

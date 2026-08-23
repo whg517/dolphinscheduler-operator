@@ -138,6 +138,7 @@ func (s *ImageSpec) toCommonsImage() *commonsv1alpha1.ImageSpec {
 		Repo:            s.Repo,
 		ProductVersion:  s.ProductVersion,
 		KubedoopVersion: s.KubedoopVersion,
+		PullSecretName:  s.PullSecretName,
 	}
 	if s.PullPolicy != nil {
 		img.PullPolicy = *s.PullPolicy

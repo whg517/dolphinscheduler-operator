@@ -12,7 +12,7 @@ import (
 	authv1alpha1 "github.com/zncdatadev/operator-go/pkg/apis/authentication/v1alpha1"
 	commonsv1alpha1 "github.com/zncdatadev/operator-go/pkg/apis/commons/v1alpha1"
 	"github.com/zncdatadev/operator-go/pkg/config"
-	"github.com/zncdatadev/operator-go/pkg/productlogging"
+	opgoconstant "github.com/zncdatadev/operator-go/pkg/constant"
 	"github.com/zncdatadev/operator-go/pkg/reconciler"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -28,6 +28,10 @@ const (
 	testClusterName = "test-dolphinscheduler"
 	testNamespace   = "default"
 )
+
+// expectedShell pins the container shell invocation the start script runs under (the first five
+// elements of every role's declared Command; the script is the sixth).
+var expectedShell = []string{"/bin/bash", "-x", "-euo", "pipefail", "-c"}
 
 func newTestCluster() *dolphinv1alpha1.DolphinschedulerCluster {
 	pullPolicy := corev1.PullIfNotPresent
@@ -64,25 +68,65 @@ func newTestCluster() *dolphinv1alpha1.DolphinschedulerCluster {
 	}
 }
 
-// newBuildContext assembles a RoleGroupBuildContext the way GenericReconciler does (product
-// config lowest, then role, then group overrides; role config folded into the group).
-func newBuildContext(cr *dolphinv1alpha1.DolphinschedulerCluster, roleName string) *reconciler.RoleGroupBuildContext {
+// declareRole produces one role's declaration through the handler's RoleProvider seam, the way
+// GenericReconciler does (once per pass, with the cr and a client in hand).
+func declareRole(
+	ctx context.Context,
+	handler *DolphinSchedulerRoleGroupHandler,
+	c ctrlclient.Client,
+	cr *dolphinv1alpha1.DolphinschedulerCluster,
+	roleName string,
+) reconciler.RoleDeclaration {
+	GinkgoHelper()
+	catalog, err := handler.DeclareRoles(ctx, c, cr)
+	Expect(err).NotTo(HaveOccurred())
+	decl, ok := catalog[roleName]
+	Expect(ok).To(BeTrue(), "role %s missing from the catalog", roleName)
+	return decl
+}
+
+// newBuildContext assembles a RoleGroupBuildContext the way GenericReconciler does: the
+// declared config defaults folded beneath the CR's role and role group levels, the derived
+// contribution merged beneath the role/group overrides, and the image resolved once.
+func newBuildContext(
+	cr *dolphinv1alpha1.DolphinschedulerCluster,
+	roleName string,
+	decl reconciler.RoleDeclaration,
+) *reconciler.RoleGroupBuildContext {
+	GinkgoHelper()
 	groupName := defaultRoleGroupName
 	spec := cr.GetSpec()
 	roleSpec := spec.Roles[roleName]
 	groupSpec := roleSpec.RoleGroups[groupName]
 
-	merged := config.NewConfigMerger().Merge(
-		ProductConfig(cr, roleName, groupName),
-		roleSpec.GetOverrides(),
-		groupSpec.GetOverrides(),
-	)
-	merged.Logging = productlogging.MergeLoggingSpec(roleSpec.GetConfig().Logging, groupSpec.GetConfig().Logging)
-
+	foldedConfig, _, err := reconciler.FoldCommonConfig(
+		decl.ConfigDefaults, roleSpec.GetConfig(), groupSpec.GetConfig())
+	Expect(err).NotTo(HaveOccurred())
 	mergedGroupSpec := groupSpec.DeepCopy()
-	mergedGroupSpec.Config = reconciler.MergeRoleGroupConfig(roleSpec.GetConfig(), groupSpec.GetConfig())
+	mergedGroupSpec.Config = foldedConfig
+
+	contribution, err := ResolveRoleGroup(context.Background(), nil, cr, nil)
+	Expect(err).NotTo(HaveOccurred())
+	derived := &commonsv1alpha1.OverridesSpec{
+		ConfigOverrides: contribution.ConfigOverrides,
+		EnvOverrides:    contribution.EnvVars,
+	}
+	merged := config.NewConfigMerger().Merge(derived, roleSpec.GetOverrides(), groupSpec.GetOverrides())
+	merged.Logging = foldedConfig.Logging
+
+	imageDefaults := ProductImageDefaults()
+	reference, err := spec.Image.ResolveImage(dolphinv1alpha1.DefaultProductName, imageDefaults)
+	Expect(err).NotTo(HaveOccurred())
 
 	return &reconciler.RoleGroupBuildContext{
+		Declaration: decl,
+		ResolvedImage: reconciler.ResolvedImage{
+			Reference:      reference,
+			PullPolicy:     spec.Image.ResolvedPullPolicy(imageDefaults),
+			PullSecretName: spec.Image.ResolvedPullSecretName(imageDefaults),
+			ProductVersion: spec.Image.ResolvedProductVersion(imageDefaults),
+		},
+		ProductName:        dolphinv1alpha1.DefaultProductName,
 		ClusterName:        cr.GetName(),
 		ClusterNamespace:   cr.GetNamespace(),
 		ClusterLabels:      map[string]string{},
@@ -93,7 +137,7 @@ func newBuildContext(cr *dolphinv1alpha1.DolphinschedulerCluster, roleName strin
 		RoleGroupSpec:      *mergedGroupSpec,
 		MergedConfig:       merged,
 		ResourceName:       reconciler.RoleGroupResourceName(cr.GetName(), roleName, groupName),
-		ServiceAccountName: dolphinv1alpha1.DefaultProductName,
+		ServiceAccountName: reconciler.ServiceAccountResourceName("DolphinschedulerCluster", cr.GetName()),
 	}
 }
 
@@ -118,48 +162,92 @@ var _ = Describe("DolphinSchedulerRoleGroupHandler", func() {
 		ctx = context.Background()
 	})
 
-	Describe("workload kinds", func() {
-		It("declares StatefulSet for master/worker and Deployment for api/alert", func() {
-			Expect(handler.WorkloadKindFor(dolphinv1alpha1.RoleMaster)).To(Equal(reconciler.WorkloadKindStatefulSet))
-			Expect(handler.WorkloadKindFor(dolphinv1alpha1.RoleWorker)).To(Equal(reconciler.WorkloadKindStatefulSet))
-			Expect(handler.WorkloadKindFor(dolphinv1alpha1.RoleApi)).To(Equal(reconciler.WorkloadKindDeployment))
-			Expect(handler.WorkloadKindFor(dolphinv1alpha1.RoleAlert)).To(Equal(reconciler.WorkloadKindDeployment))
+	Describe("role catalog", func() {
+		It("declares exactly the four roles, each internally valid", func() {
+			catalog, err := handler.DeclareRoles(ctx, newFakeClient(), cr)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(catalog).To(HaveLen(4))
+			for _, role := range []string{
+				dolphinv1alpha1.RoleMaster,
+				dolphinv1alpha1.RoleWorker,
+				dolphinv1alpha1.RoleApi,
+				dolphinv1alpha1.RoleAlert,
+			} {
+				decl, ok := catalog[role]
+				Expect(ok).To(BeTrue(), "role %s", role)
+				Expect(decl.Validate(role)).To(Succeed(), "role %s", role)
+				Expect(decl.MainContainerName).To(Equal(mainContainerNames[role]))
+				// The start script is the command's last element; args stay the user's.
+				Expect(decl.Command).To(HaveLen(6), "role %s", role)
+				Expect(decl.Command[:5]).To(Equal(expectedShell))
+				Expect(decl.Command[5]).To(ContainSubstring("bin/start.sh &"), "role %s", role)
+				Expect(decl.LogVolumeSize).To(Equal(legacyLogVolumeSize))
+				Expect(decl.ConfigDefaults).NotTo(BeNil())
+				Expect(decl.ConfigDefaults.GracefulShutdownTimeout).To(HaveValue(Equal("120s")))
+			}
 		})
 
-		It("builds the e2e-pinned workload kinds and resource names", func() {
-			byRole := map[string]struct {
-				statefulSet bool
-			}{
-				dolphinv1alpha1.RoleMaster: {statefulSet: true},
-				dolphinv1alpha1.RoleWorker: {statefulSet: true},
-				dolphinv1alpha1.RoleApi:    {statefulSet: false},
-				dolphinv1alpha1.RoleAlert:  {statefulSet: false},
+		It("declares the data volume on the worker only", func() {
+			catalog, err := handler.DeclareRoles(ctx, newFakeClient(), cr)
+			Expect(err).NotTo(HaveOccurred())
+			worker := catalog[dolphinv1alpha1.RoleWorker]
+			Expect(worker.DataVolume).To(Equal(&reconciler.DataVolume{
+				Name:      "worker-data",
+				MountPath: workerDataMountPath,
+			}))
+			for _, role := range []string{dolphinv1alpha1.RoleMaster, dolphinv1alpha1.RoleApi, dolphinv1alpha1.RoleAlert} {
+				Expect(catalog[role].DataVolume).To(BeNil(), "role %s", role)
 			}
-			for role, expect := range byRole {
-				buildCtx := newBuildContext(cr, role)
-				res, err := handler.BuildResources(ctx, newFakeClient(), cr, buildCtx)
+		})
+
+		It("builds the e2e-pinned resource names, all as StatefulSets", func() {
+			for _, role := range []string{
+				dolphinv1alpha1.RoleMaster,
+				dolphinv1alpha1.RoleWorker,
+				dolphinv1alpha1.RoleApi,
+				dolphinv1alpha1.RoleAlert,
+			} {
+				c := newFakeClient()
+				decl := declareRole(ctx, handler, c, cr, role)
+				buildCtx := newBuildContext(cr, role, decl)
+				res, err := handler.BuildResources(ctx, c, cr, buildCtx)
 				Expect(err).NotTo(HaveOccurred(), "role %s", role)
 
 				name := fmt.Sprintf("%s-%s-default", testClusterName, role)
-				if expect.statefulSet {
-					Expect(res.StatefulSet).NotTo(BeNil(), "role %s", role)
-					Expect(res.Deployment).To(BeNil(), "role %s", role)
-					Expect(res.StatefulSet.Name).To(Equal(name))
-				} else {
-					Expect(res.Deployment).NotTo(BeNil(), "role %s", role)
-					Expect(res.StatefulSet).To(BeNil(), "role %s", role)
-					Expect(res.Deployment.Name).To(Equal(name))
-				}
+				Expect(res.StatefulSet).NotTo(BeNil(), "role %s", role)
+				Expect(res.StatefulSet.Name).To(Equal(name))
 				Expect(res.ConfigMap.Name).To(Equal(name))
 				Expect(res.Service.Name).To(Equal(name))
+				Expect(res.HeadlessService.Name).To(Equal(name + "-headless"))
 			}
+		})
+
+		It("declares a worker storage default that renders the legacy 2Gi claim", func() {
+			c := newFakeClient()
+			decl := declareRole(ctx, handler, c, cr, dolphinv1alpha1.RoleWorker)
+			buildCtx := newBuildContext(cr, dolphinv1alpha1.RoleWorker, decl)
+			res, err := handler.BuildResources(ctx, c, cr, buildCtx)
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(res.StatefulSet.Spec.VolumeClaimTemplates).To(HaveLen(1))
+			vct := res.StatefulSet.Spec.VolumeClaimTemplates[0]
+			Expect(vct.Name).To(Equal("worker-data"))
+			Expect(vct.Spec.Resources.Requests.Storage().String()).To(Equal("2Gi"))
+
+			container := res.StatefulSet.Spec.Template.Spec.Containers[0]
+			Expect(container.VolumeMounts).To(ContainElement(corev1.VolumeMount{
+				Name:      "worker-data",
+				MountPath: workerDataMountPath,
+			}))
 		})
 	})
 
 	Describe("metrics service", func() {
 		It("renders the exact legacy shape", func() {
-			buildCtx := newBuildContext(cr, dolphinv1alpha1.RoleMaster)
-			res, err := handler.BuildResources(ctx, newFakeClient(), cr, buildCtx)
+			c := newFakeClient()
+			decl := declareRole(ctx, handler, c, cr, dolphinv1alpha1.RoleMaster)
+			buildCtx := newBuildContext(cr, dolphinv1alpha1.RoleMaster, decl)
+			res, err := handler.BuildResources(ctx, c, cr, buildCtx)
 			Expect(err).NotTo(HaveOccurred())
 
 			svc := res.MetricsService
@@ -199,8 +287,10 @@ var _ = Describe("DolphinSchedulerRoleGroupHandler", func() {
 				dolphinv1alpha1.RoleAlert:  50053,
 			}
 			for role, port := range ports {
-				buildCtx := newBuildContext(cr, role)
-				res, err := handler.BuildResources(ctx, newFakeClient(), cr, buildCtx)
+				c := newFakeClient()
+				decl := declareRole(ctx, handler, c, cr, role)
+				buildCtx := newBuildContext(cr, role, decl)
+				res, err := handler.BuildResources(ctx, c, cr, buildCtx)
 				Expect(err).NotTo(HaveOccurred(), "role %s", role)
 				Expect(res.MetricsService.Spec.Ports[0].Port).To(Equal(port), "role %s", role)
 				Expect(res.MetricsService.Annotations["prometheus.io/port"]).To(Equal(fmt.Sprintf("%d", port)), "role %s", role)
@@ -212,24 +302,29 @@ var _ = Describe("DolphinSchedulerRoleGroupHandler", func() {
 		var container corev1.Container
 
 		BeforeEach(func() {
-			buildCtx := newBuildContext(cr, dolphinv1alpha1.RoleMaster)
-			res, err := handler.BuildResources(ctx, newFakeClient(), cr, buildCtx)
+			c := newFakeClient()
+			decl := declareRole(ctx, handler, c, cr, dolphinv1alpha1.RoleMaster)
+			buildCtx := newBuildContext(cr, dolphinv1alpha1.RoleMaster, decl)
+			res, err := handler.BuildResources(ctx, c, cr, buildCtx)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(res.StatefulSet.Spec.Template.Spec.Containers).To(HaveLen(1))
 			container = res.StatefulSet.Spec.Template.Spec.Containers[0]
 		})
 
-		It("keeps the legacy container name, command and start script", func() {
+		It("keeps the legacy container name and carries the start script in the command", func() {
 			Expect(container.Name).To(Equal("master-server"))
-			Expect(container.Command).To(Equal([]string{"/bin/bash", "-x", "-euo", "pipefail", "-c"}))
-			Expect(container.Args).To(HaveLen(1))
-			script := container.Args[0]
+			Expect(container.Command).To(HaveLen(6))
+			Expect(container.Command[:5]).To(Equal(expectedShell))
+			script := container.Command[5]
 			Expect(script).To(ContainSubstring("prepare_signal_handlers"))
 			Expect(script).To(ContainSubstring("master-server/bin/start.sh &"))
 			Expect(script).To(ContainSubstring("wait_for_termination $!"))
-			Expect(script).To(ContainSubstring("rm -f /kubedoop/log/_vector/shutdown"))
+			// The Vector shutdown-marker lines are gone (native sidecar).
+			Expect(script).NotTo(ContainSubstring("_vector/shutdown"))
 			// The start block appears exactly once.
 			Expect(strings.Count(script, "bin/start.sh &")).To(Equal(1))
+			// Args belong to the user's cliOverrides alone now.
+			Expect(container.Args).To(BeEmpty())
 		})
 
 		It("renders the exact legacy env list plus the product default env", func() {
@@ -256,7 +351,7 @@ var _ = Describe("DolphinSchedulerRoleGroupHandler", func() {
 				"MASTER_TASK_COMMIT_INTERVAL",
 				"MASTER_TASK_COMMIT_RETRYTIMES",
 				zkConnectStringEnvName,
-				// From ProductConfig EnvOverrides (also present via envFrom "<cluster>-envs").
+				// From the derived contribution (also present via envFrom "<cluster>-envs").
 				"SPRING_JACKSON_TIME_ZONE",
 				"TZ",
 			}))
@@ -301,7 +396,7 @@ var _ = Describe("DolphinSchedulerRoleGroupHandler", func() {
 			Expect(container.StartupProbe.FailureThreshold).To(Equal(int32(60)))
 		})
 
-		It("mounts the config files at the legacy subPath targets", func() {
+		It("mounts the config files at the legacy subPath targets and keeps the framework mount", func() {
 			Expect(container.VolumeMounts[0]).To(Equal(corev1.VolumeMount{
 				Name:      configVolumeName,
 				MountPath: "/kubedoop/dolphinscheduler/master-server/conf/common.properties",
@@ -311,6 +406,12 @@ var _ = Describe("DolphinSchedulerRoleGroupHandler", func() {
 				Name:      configVolumeName,
 				MountPath: "/kubedoop/dolphinscheduler/master-server/conf/logback-spring.xml",
 				SubPath:   "logback-spring.xml",
+			}))
+			// The framework's whole-directory config mount is kept (harmless read-only dir).
+			Expect(container.VolumeMounts).To(ContainElement(corev1.VolumeMount{
+				Name:      configVolumeName,
+				MountPath: opgoconstant.KubedoopConfigDirMount,
+				ReadOnly:  true,
 			}))
 		})
 
@@ -327,12 +428,14 @@ var _ = Describe("DolphinSchedulerRoleGroupHandler", func() {
 
 	Describe("alert role", func() {
 		It("keeps the historical alerter-server container name over the alert-server binary", func() {
-			buildCtx := newBuildContext(cr, dolphinv1alpha1.RoleAlert)
-			res, err := handler.BuildResources(ctx, newFakeClient(), cr, buildCtx)
+			c := newFakeClient()
+			decl := declareRole(ctx, handler, c, cr, dolphinv1alpha1.RoleAlert)
+			buildCtx := newBuildContext(cr, dolphinv1alpha1.RoleAlert, decl)
+			res, err := handler.BuildResources(ctx, c, cr, buildCtx)
 			Expect(err).NotTo(HaveOccurred())
-			container := res.Deployment.Spec.Template.Spec.Containers[0]
+			container := res.StatefulSet.Spec.Template.Spec.Containers[0]
 			Expect(container.Name).To(Equal("alerter-server"))
-			Expect(container.Args[0]).To(ContainSubstring("alert-server/bin/start.sh &"))
+			Expect(container.Command[len(container.Command)-1]).To(ContainSubstring("alert-server/bin/start.sh &"))
 			Expect(container.VolumeMounts[0].MountPath).To(
 				Equal("/kubedoop/dolphinscheduler/alert-server/conf/common.properties"))
 		})
@@ -340,8 +443,10 @@ var _ = Describe("DolphinSchedulerRoleGroupHandler", func() {
 
 	Describe("config map", func() {
 		It("renders common.properties with the legacy sorted serializer and defaults", func() {
-			buildCtx := newBuildContext(cr, dolphinv1alpha1.RoleMaster)
-			res, err := handler.BuildResources(ctx, newFakeClient(), cr, buildCtx)
+			c := newFakeClient()
+			decl := declareRole(ctx, handler, c, cr, dolphinv1alpha1.RoleMaster)
+			buildCtx := newBuildContext(cr, dolphinv1alpha1.RoleMaster, decl)
+			res, err := handler.BuildResources(ctx, c, cr, buildCtx)
 			Expect(err).NotTo(HaveOccurred())
 
 			Expect(res.ConfigMap.Data).To(HaveKey("common.properties"))
@@ -362,8 +467,10 @@ var _ = Describe("DolphinSchedulerRoleGroupHandler", func() {
 					"common.properties": {"data.basedir.path": "/custom"},
 				},
 			}
-			buildCtx := newBuildContext(cr, dolphinv1alpha1.RoleMaster)
-			res, err := handler.BuildResources(ctx, newFakeClient(), cr, buildCtx)
+			c := newFakeClient()
+			decl := declareRole(ctx, handler, c, cr, dolphinv1alpha1.RoleMaster)
+			buildCtx := newBuildContext(cr, dolphinv1alpha1.RoleMaster, decl)
+			res, err := handler.BuildResources(ctx, c, cr, buildCtx)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(res.ConfigMap.Data["common.properties"]).To(ContainSubstring("data.basedir.path=/custom\n"))
 		})
@@ -371,8 +478,10 @@ var _ = Describe("DolphinSchedulerRoleGroupHandler", func() {
 
 	Describe("services", func() {
 		It("keeps the legacy service port names and numbers", func() {
-			buildCtx := newBuildContext(cr, dolphinv1alpha1.RoleWorker)
-			res, err := handler.BuildResources(ctx, newFakeClient(), cr, buildCtx)
+			c := newFakeClient()
+			decl := declareRole(ctx, handler, c, cr, dolphinv1alpha1.RoleWorker)
+			buildCtx := newBuildContext(cr, dolphinv1alpha1.RoleWorker, decl)
+			res, err := handler.BuildResources(ctx, c, cr, buildCtx)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(res.Service.Spec.Ports).To(Equal([]corev1.ServicePort{
 				{Name: "actual-port", Port: 1235, Protocol: corev1.ProtocolTCP, TargetPort: intstr.FromString("actual-port")},
@@ -398,17 +507,19 @@ var _ = Describe("DolphinSchedulerRoleGroupHandler", func() {
 					},
 				},
 			}
-			// AuthenticationClass is cluster-scoped in spirit but resolved in the CR namespace
-			// by the legacy code path; the fake object carries no namespace.
 			cr.Spec.ClusterConfig.Authentication = []dolphinv1alpha1.AuthenticationSpec{
 				{AuthenticationClass: "ldap"},
 			}
 
-			buildCtx := newBuildContext(cr, dolphinv1alpha1.RoleApi)
-			res, err := handler.BuildResources(ctx, newFakeClient(authClass), cr, buildCtx)
+			// Auth resolution happens in DeclareRoles (env + script prologue) and again in
+			// BuildResources (the CSI bind-credentials volume), so both get the same client.
+			c := newFakeClient(authClass)
+			decl := declareRole(ctx, handler, c, cr, dolphinv1alpha1.RoleApi)
+			buildCtx := newBuildContext(cr, dolphinv1alpha1.RoleApi, decl)
+			res, err := handler.BuildResources(ctx, c, cr, buildCtx)
 			Expect(err).NotTo(HaveOccurred())
 
-			container := res.Deployment.Spec.Template.Spec.Containers[0]
+			container := res.StatefulSet.Spec.Template.Spec.Containers[0]
 
 			names := make([]string, 0, len(container.Env))
 			zkEnvCount := 0
@@ -425,7 +536,7 @@ var _ = Describe("DolphinSchedulerRoleGroupHandler", func() {
 
 			// The credentials-export prologue precedes exactly one start block (the legacy api
 			// rendering duplicated the block).
-			script := container.Args[0]
+			script := container.Command[len(container.Command)-1]
 			Expect(script).To(HavePrefix("export SECURITY_AUTHENTICATION_LDAP_USERNAME"))
 			Expect(strings.Count(script, "bin/start.sh &")).To(Equal(1))
 
@@ -440,7 +551,7 @@ var _ = Describe("DolphinSchedulerRoleGroupHandler", func() {
 			Expect(ldapMount.MountPath).To(Equal("/kubedoop/secret/ldap-bind-credentials"))
 
 			var ldapVolume *corev1.Volume
-			podSpec := res.Deployment.Spec.Template.Spec
+			podSpec := res.StatefulSet.Spec.Template.Spec
 			for i := range podSpec.Volumes {
 				if podSpec.Volumes[i].Name == dolphinv1alpha1.LdapBindCredintialsVolumeName {
 					ldapVolume = &podSpec.Volumes[i]

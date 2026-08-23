@@ -5,14 +5,16 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
+	"time"
 
 	dolphinv1alpha1 "github.com/zncdatadev/dolphinscheduler-operator/api/v1alpha1"
 	"github.com/zncdatadev/dolphinscheduler-operator/pkg/util"
-	"github.com/zncdatadev/operator-go/pkg/builder"
 	opcommon "github.com/zncdatadev/operator-go/pkg/common"
+	"github.com/zncdatadev/operator-go/pkg/reconciler"
+	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
-	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -26,16 +28,17 @@ import (
 // +kubebuilder:rbac:groups=dolphinscheduler.kubedoop.dev,resources=dolphinschedulerclusters,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=dolphinscheduler.kubedoop.dev,resources=dolphinschedulerclusters/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=dolphinscheduler.kubedoop.dev,resources=dolphinschedulerclusters/finalizers,verbs=update
-// +kubebuilder:rbac:groups=core,resources=serviceaccounts,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=core,resources=serviceaccounts,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;delete
 // +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=secrets.kubedoop.dev,resources=secretclasses,verbs=get;list;watch
 // +kubebuilder:rbac:groups=s3.kubedoop.dev,resources=s3connections,verbs=get;list;watch
@@ -43,23 +46,29 @@ import (
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
 
 const (
-	// workloadRBACName is the literal name of the workload ServiceAccount, Role and RoleBinding.
-	// Static by design (D5): the pod spec references it and existing clusters depend on it. Two
-	// clusters in one namespace collide on it — a pre-existing footgun tracked separately.
-	workloadRBACName = dolphinv1alpha1.DefaultProductName
-
 	// dbInitJobContainerName / dbInitWaitContainerName are the DB-init Job container names.
 	dbInitJobContainerName  = "dolphinscheduler-db-init-job"
 	dbInitWaitContainerName = "wait-for-database"
 
 	// dbInitWaitImage is the init container image probing the database port.
 	dbInitWaitImage = "busybox:1.30.1"
+
+	// dbInitWaitReason / dbInitWaitMessage are the Waiting condition of the DB-init gate. The
+	// message is deliberately CONSTANT across passes: the status write is DeepEqual-guarded and
+	// this path returns no error, so a varying message would rewrite the CR forever. The
+	// namespace/name go into a log line instead.
+	dbInitWaitReason  = "WaitingForDBInit"
+	dbInitWaitMessage = "the database schema initialization Job has not completed"
+
+	// dbInitRequeueAfter is how long to wait between DB-init Job checks.
+	dbInitRequeueAfter = 15 * time.Second
 )
 
-// ClusterExtension provisions the cluster-scoped resources the role groups depend on, in
-// order: the workload Role/RoleBinding (the framework itself ensures the ServiceAccount), the
-// "<cluster>-envs" ConfigMap and the create-once DB schema init Job. PreReconcile returns an
-// error until the Job has succeeded, so the roles wait for the schema — the legacy ordering.
+// ClusterExtension provisions the cluster-scoped resources the role groups depend on: the
+// "<cluster>-envs" ConfigMap and the create-once DB schema init Job. PreReconcile returns a
+// typed wait until the Job has succeeded, so the roles wait for the schema — the legacy
+// ordering. It also guards the Deployment-to-StatefulSet upgrade: a leftover controller-owned
+// api/alert Deployment fails the cluster with an explicit runbook error.
 type ClusterExtension struct {
 	scheme *runtime.Scheme
 }
@@ -76,7 +85,7 @@ func (e *ClusterExtension) Name() string { return "dolphinscheduler-cluster" }
 
 // PreReconcile implements opcommon.ClusterExtension.
 func (e *ClusterExtension) PreReconcile(ctx context.Context, c ctrlclient.Client, cr *dolphinv1alpha1.DolphinschedulerCluster) error {
-	if err := e.ensureWorkloadRBAC(ctx, c, cr); err != nil {
+	if err := e.ensureNoLegacyDeployments(ctx, c, cr); err != nil {
 		return err
 	}
 	if err := e.ensureEnvsConfigMap(ctx, c, cr); err != nil {
@@ -95,48 +104,49 @@ func (e *ClusterExtension) OnReconcileError(_ context.Context, _ ctrlclient.Clie
 	return nil
 }
 
-// ensureWorkloadRBAC applies the workload Role and RoleBinding (literal name
-// "dolphinscheduler", configmaps get/list/watch — the registry discovery ConfigMap read). The
-// ServiceAccount of the same name is ensured by the GenericReconciler (ServiceAccountName).
-func (e *ClusterExtension) ensureWorkloadRBAC(ctx context.Context, c ctrlclient.Client, cr *dolphinv1alpha1.DolphinschedulerCluster) error {
-	labels := legacyClusterLabels(cr.Name)
+// ensureNoLegacyDeployments is the Deployment-to-StatefulSet upgrade guard. Pre-0.13 operators
+// rendered the api/alert roles as Deployments; the same-named StatefulSets this operator builds
+// do NOT conflict with them (different resources), so both would run at once behind the same
+// selector — every client Service serving doubled endpoints, half of them pods of a template
+// never updated again. Detect-and-fail: the reconcile is blocked with an explicit runbook error
+// until the leftover Deployments are deleted manually.
+func (e *ClusterExtension) ensureNoLegacyDeployments(ctx context.Context, c ctrlclient.Client, cr *dolphinv1alpha1.DolphinschedulerCluster) error {
+	spec := cr.GetSpec()
 
-	desiredRole := builder.NewRoleBuilder(workloadRBACName, cr.Namespace).
-		WithLabels(labels).
-		AddPolicyRule(rbacv1.PolicyRule{
-			Verbs:     []string{"get", "list", "watch"},
-			APIGroups: []string{""},
-			Resources: []string{"configmaps"},
-		}).
-		Build()
-	role := &rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: desiredRole.Name, Namespace: desiredRole.Namespace}}
-	if _, err := controllerutil.CreateOrUpdate(ctx, c, role, func() error {
-		role.Labels = desiredRole.Labels
-		role.Rules = desiredRole.Rules
-		return controllerutil.SetControllerReference(cr, role, e.scheme)
-	}); err != nil {
-		return fmt.Errorf("failed to ensure workload role %s/%s: %w", cr.Namespace, workloadRBACName, err)
-	}
-
-	desiredBinding := builder.NewRoleBindingBuilder(workloadRBACName, cr.Namespace).
-		WithLabels(labels).
-		WithRoleRef(workloadRBACName).
-		AddServiceAccountSubject(workloadRBACName, cr.Namespace).
-		Build()
-	binding := &rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: desiredBinding.Name, Namespace: desiredBinding.Namespace}}
-	if _, err := controllerutil.CreateOrUpdate(ctx, c, binding, func() error {
-		binding.Labels = desiredBinding.Labels
-		// RoleRef is immutable on a live RoleBinding; set it only at creation.
-		if binding.CreationTimestamp.IsZero() {
-			binding.RoleRef = desiredBinding.RoleRef
+	var leftovers []string
+	for _, roleName := range []string{dolphinv1alpha1.RoleApi, dolphinv1alpha1.RoleAlert} {
+		roleSpec, declared := spec.Roles[roleName]
+		if !declared {
+			continue
 		}
-		binding.Subjects = desiredBinding.Subjects
-		return controllerutil.SetControllerReference(cr, binding, e.scheme)
-	}); err != nil {
-		return fmt.Errorf("failed to ensure workload rolebinding %s/%s: %w", cr.Namespace, workloadRBACName, err)
+		for groupName := range roleSpec.RoleGroups {
+			name := reconciler.RoleGroupResourceName(cr.Name, roleName, groupName)
+			deployment := &appsv1.Deployment{}
+			err := c.Get(ctx, types.NamespacedName{Namespace: cr.Namespace, Name: name}, deployment)
+			switch {
+			case apierrors.IsNotFound(err):
+				continue
+			case err != nil:
+				return fmt.Errorf("failed to check for a legacy Deployment %s/%s: %w", cr.Namespace, name, err)
+			}
+			// Only a Deployment this CR controller-owns is the legacy workload; anything else
+			// merely shares a name and is none of our business.
+			if metav1.IsControlledBy(deployment, cr) {
+				leftovers = append(leftovers, name)
+			}
+		}
+	}
+	if len(leftovers) == 0 {
+		return nil
 	}
 
-	return nil
+	slices.Sort(leftovers)
+	return fmt.Errorf(
+		"legacy Deployment workload(s) %s from a pre-StatefulSet operator version still exist: "+
+			"the api/alert roles now render StatefulSets with the same names and selectors, and both "+
+			"running at once doubles every Service's endpoints; run "+
+			"`kubectl -n %s delete deployment %s` and the reconcile will proceed",
+		strings.Join(leftovers, ", "), cr.Namespace, strings.Join(leftovers, " "))
 }
 
 // ensureEnvsConfigMap applies the "<cluster>-envs" ConfigMap every container (and the DB-init
@@ -198,9 +208,10 @@ func (e *ClusterExtension) ensureEnvsConfigMap(ctx context.Context, c ctrlclient
 	return nil
 }
 
-// ensureDBInitJob creates the DB schema init Job (name = the cluster name) once and returns an
-// error until it has succeeded, so the role groups are not reconciled before the schema exists.
-// A Job's spec is immutable: the Job is never updated, and a concurrent create is tolerated.
+// ensureDBInitJob creates the DB schema init Job (name = the cluster name) once and returns a
+// typed wait until it has succeeded, so the role groups are not reconciled before the schema
+// exists (Waiting condition, no Degraded, no Warning event). A Job's spec is immutable: the Job
+// is never updated, and a concurrent create is tolerated.
 func (e *ClusterExtension) ensureDBInitJob(ctx context.Context, c ctrlclient.Client, cr *dolphinv1alpha1.DolphinschedulerCluster) error {
 	clusterConfig := cr.Spec.ClusterConfig
 	if clusterConfig == nil || clusterConfig.Database == nil {
@@ -222,7 +233,8 @@ func (e *ClusterExtension) ensureDBInitJob(ctx context.Context, c ctrlclient.Cli
 		if err := c.Create(ctx, job); err != nil && !apierrors.IsAlreadyExists(err) {
 			return fmt.Errorf("failed to create DB init job %s/%s: %w", cr.Namespace, cr.Name, err)
 		}
-		return fmt.Errorf("waiting for DB init job %s/%s to complete", cr.Namespace, cr.Name)
+		log.FromContext(ctx).Info("waiting for DB init job to complete", "namespace", cr.Namespace, "job", cr.Name)
+		return opcommon.NewRequeueAfterError(dbInitRequeueAfter, dbInitWaitReason, dbInitWaitMessage)
 	case err != nil:
 		return fmt.Errorf("failed to get DB init job %s/%s: %w", cr.Namespace, cr.Name, err)
 	}
@@ -230,7 +242,8 @@ func (e *ClusterExtension) ensureDBInitJob(ctx context.Context, c ctrlclient.Cli
 	if existing.Status.Succeeded > 0 {
 		return nil
 	}
-	return fmt.Errorf("waiting for DB init job %s/%s to complete", cr.Namespace, cr.Name)
+	log.FromContext(ctx).Info("waiting for DB init job to complete", "namespace", cr.Namespace, "job", cr.Name)
+	return opcommon.NewRequeueAfterError(dbInitRequeueAfter, dbInitWaitReason, dbInitWaitMessage)
 }
 
 // buildDBInitJob renders the legacy DB-init Job: a busybox init container waiting for the

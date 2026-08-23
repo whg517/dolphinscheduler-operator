@@ -3,22 +3,12 @@ package controller
 import (
 	"fmt"
 	"strings"
-
-	opgoconstant "github.com/zncdatadev/operator-go/pkg/constant"
 )
 
-// The bash trap/termination helpers below reproduce, byte for byte, the start script the
-// operator has always rendered (they were operator-go v0.12 `pkg/util` bash helpers, removed
-// from the framework in v0.13). The pods' args are part of the rendered-YAML parity contract,
-// so they are kept verbatim here.
-
-// vectorShutdownDir/vectorShutdownFile are the Vector shutdown marker the legacy script
-// touches on exit. The v0.13 Vector agent runs as a native sidecar and no longer reads the
-// marker, but the script lines stay for byte parity of the container args.
-const (
-	vectorLogSubDir    = "_vector/"
-	vectorShutdownFile = "shutdown"
-)
+// The bash trap/termination helpers below reproduce the start script the operator has always
+// rendered (they were operator-go v0.12 `pkg/util` bash helpers, removed from the framework in
+// v0.13). The Vector shutdown-marker lines the legacy script carried are gone: the v0.13 Vector
+// agent runs as a native sidecar and no longer reads the marker file.
 
 const (
 	invokePrepareSignalHandlers = "prepare_signal_handlers"
@@ -55,19 +45,9 @@ wait_for_termination()
 }`
 
 // containerCommand is the shell every DolphinScheduler container (and the DB-init Job) runs
-// its script under.
+// its script under. The role containers carry the start script as the command's last element
+// (RoleDeclaration.Command), so args stay purely the user's cliOverrides.
 var containerCommand = []string{"/bin/bash", "-x", "-euo", "pipefail", "-c"}
-
-// removeVectorShutdownFileCommand removes the marker file before the product starts.
-func removeVectorShutdownFileCommand() string {
-	return fmt.Sprintf("rm -f %s%s%s", opgoconstant.KubedoopLogDir, vectorLogSubDir, vectorShutdownFile)
-}
-
-// createVectorShutdownFileCommand creates the marker file after the product terminates.
-func createVectorShutdownFileCommand() string {
-	return fmt.Sprintf("mkdir -p %s%s && touch %s%s%s",
-		opgoconstant.KubedoopLogDir, vectorLogSubDir, opgoconstant.KubedoopLogDir, vectorLogSubDir, vectorShutdownFile)
-}
 
 // roleServerName returns the DolphinScheduler server directory/binary segment for a role:
 // master-server, worker-server, api-server, alert-server. Note "alert-server" (the product
@@ -77,15 +57,12 @@ func roleServerName(roleName string) string {
 }
 
 // mainContainerScript is the start script of every role's main container: trap functions,
-// Vector marker handling, background start + wait-for-termination. Identical to the legacy
-// rendering (one block; the historical duplicated block of the api role is deliberately gone).
+// background start + wait-for-termination.
 func mainContainerScript(roleName string) string {
 	return strings.Join([]string{
 		commonBashTrapFunctions,
-		removeVectorShutdownFileCommand(),
 		invokePrepareSignalHandlers,
 		fmt.Sprintf("%s/bin/start.sh &", roleServerName(roleName)),
 		invokeWaitForTermination,
-		createVectorShutdownFileCommand(),
 	}, "\n")
 }

@@ -85,18 +85,18 @@ status:
   replicas: 1
   availableReplicas: 1
 ---
-# API Deployment
+# API StatefulSet
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: test-dolphinscheduler-observability-api-default
 status:
   replicas: 1
   availableReplicas: 1
 ---
-# Alerter Deployment
+# Alerter StatefulSet
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: test-dolphinscheduler-observability-alert-default
 status:

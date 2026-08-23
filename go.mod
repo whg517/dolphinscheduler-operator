@@ -6,7 +6,7 @@ require (
 	emperror.dev/errors v0.8.1
 	github.com/onsi/ginkgo/v2 v2.29.0
 	github.com/onsi/gomega v1.40.0
-	github.com/zncdatadev/operator-go v0.12.6
+	github.com/zncdatadev/operator-go v0.12.7-0.20260818060857-e8a949521429
 	k8s.io/api v0.35.4
 	k8s.io/apimachinery v0.35.4
 	k8s.io/client-go v0.35.4
@@ -104,5 +104,3 @@ require (
 	sigs.k8s.io/structured-merge-diff/v6 v6.3.2-0.20260122202528-d9cc6641c482 // indirect
 	sigs.k8s.io/yaml v1.6.0 // indirect
 )
-
-replace github.com/zncdatadev/operator-go => github.com/whg517/operator-go v0.0.0-20260802161200-202b9a9290ca

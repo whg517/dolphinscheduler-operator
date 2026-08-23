@@ -1,18 +1,19 @@
 package controller
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
 	"maps"
 	"slices"
 
 	dolphinv1alpha1 "github.com/zncdatadev/dolphinscheduler-operator/api/v1alpha1"
 	commonsv1alpha1 "github.com/zncdatadev/operator-go/pkg/apis/commons/v1alpha1"
+	"github.com/zncdatadev/operator-go/pkg/reconciler"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/utils/ptr"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 const (
@@ -27,10 +28,6 @@ const (
 	// defaultGracefulShutdown is the product default terminationGracePeriodSeconds (as a
 	// duration string), applied when neither the role nor the role group sets one.
 	defaultGracefulShutdown = "120s"
-
-	// defaultAntiAffinityWeight is the weight of the product-default preferred pod
-	// anti-affinity term.
-	defaultAntiAffinityWeight = int32(70)
 
 	// envJavaOpts is the JVM options env var shared by the master/api/alert defaults.
 	envJavaOpts = "JAVA_OPTS"
@@ -52,7 +49,7 @@ func defaultCommonProperties() map[string]string {
 		"alert.rpc.port":                               "50052",
 		"appId.collect":                                "log",
 		"conda.path":                                   "/opt/anaconda3/etc/profile.d/conda.sh",
-		"data.basedir.path":                            "/tmp/dolphinscheduler",
+		"data.basedir.path":                            workerDataMountPath,
 		"datasource.encryption.enable":                 defaultDisabled,
 		"datasource.encryption.salt":                   "!@#$%^&*",
 		"development.state":                            defaultDisabled,
@@ -95,16 +92,21 @@ func defaultEnvOverrides() map[string]string {
 	}
 }
 
-// ProductConfig is the GenericReconcilerConfig.ProductConfig hook: the product's configuration
-// contribution, merged as the LOWEST layer beneath role and role-group overrides, so user
-// overrides always win.
-func ProductConfig(_ *dolphinv1alpha1.DolphinschedulerCluster, _ string, _ string) *commonsv1alpha1.OverridesSpec {
-	return &commonsv1alpha1.OverridesSpec{
+// ResolveRoleGroup is the GenericReconcilerConfig.RoleGroupResolver hook: the product's
+// configuration contribution, folded as the LOWEST layer beneath role and role-group overrides,
+// so user overrides always win.
+func ResolveRoleGroup(
+	_ context.Context,
+	_ ctrlclient.Client,
+	_ *dolphinv1alpha1.DolphinschedulerCluster,
+	_ *reconciler.RoleGroupBuildContext,
+) (*reconciler.Contribution, error) {
+	return &reconciler.Contribution{
 		ConfigOverrides: map[string]map[string]string{
 			dolphinv1alpha1.DolphinCommonPropertiesName: defaultCommonProperties(),
 		},
-		EnvOverrides: defaultEnvOverrides(),
-	}
+		EnvVars: defaultEnvOverrides(),
+	}, nil
 }
 
 // roleEnvDefaults returns the role-specific default container environment as a SORTED
@@ -192,30 +194,17 @@ func roleResourceDefaults(roleName string) (*commonsv1alpha1.ResourcesSpec, erro
 
 // defaultRoleAffinity returns the legacy product-default preferred pod anti-affinity
 // (weight 70, hostname topology, matching the role's instance+component labels).
+// reconciler.RoleSelectorLabels emits exactly the app.kubernetes.io/{instance,component} pair
+// the legacy literal used, so the rendered affinity is byte-identical.
 func defaultRoleAffinity(clusterName, roleName string) (*runtime.RawExtension, error) {
-	affinity := &corev1.Affinity{
+	return reconciler.EncodeAffinity(&corev1.Affinity{
 		PodAntiAffinity: &corev1.PodAntiAffinity{
 			PreferredDuringSchedulingIgnoredDuringExecution: []corev1.WeightedPodAffinityTerm{
-				{
-					Weight: defaultAntiAffinityWeight,
-					PodAffinityTerm: corev1.PodAffinityTerm{
-						TopologyKey: corev1.LabelHostname,
-						LabelSelector: &metav1.LabelSelector{
-							MatchLabels: map[string]string{
-								labelInstanceKey:  clusterName,
-								labelComponentKey: roleName,
-							},
-						},
-					},
-				},
+				reconciler.PreferredAffinityTerm(70, reconciler.TopologyKeyHostname,
+					reconciler.RoleSelectorLabels(clusterName, roleName)),
 			},
 		},
-	}
-	raw, err := json.Marshal(affinity)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal default affinity: %w", err)
-	}
-	return &runtime.RawExtension{Raw: raw}, nil
+	})
 }
 
 // metricsPortForRole returns the Spring actuator port of a role: the port the probes hit and
